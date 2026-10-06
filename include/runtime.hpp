@@ -11,6 +11,7 @@ class Scheduler {
 
 public:
 private:
+  Queue task_queue;
 };
 
 } // namespace slp
