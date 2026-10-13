@@ -8,12 +8,23 @@
 #include <memory>
 #include <print>
 #include <thread>
+#include <vector>
 
 namespace {
 auto require(bool condition, const char *message) -> void {
   if (!condition) {
     std::println(stderr, "FAILED: {}", message);
     std::exit(EXIT_FAILURE);
+  }
+}
+
+template <typename Predicate>
+auto wait_until(Predicate predicate, const char *message) -> void {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{5};
+  while (!predicate()) {
+    require(std::chrono::steady_clock::now() < deadline, message);
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
   }
 }
 
@@ -46,10 +57,10 @@ auto processes_tasks_once(size_t worker_count) -> void {
     slp::AdaptingThreadPool<Queue, Worker> pool{queue, worker_count};
     // Workers start with an empty queue, then receive work after startup.
     for (auto &count : visits) {
-      queue->push(CountedTask{&count, &completed});
+      pool.submit(CountedTask{&count, &completed});
     }
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::seconds{5};
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds{5};
     while (completed.load(std::memory_order_acquire) < task_count) {
       require(std::chrono::steady_clock::now() < deadline,
               "workers did not finish all tasks");
@@ -92,6 +103,111 @@ auto shutdown_joins_active_task() -> void {
   require(completed.load(std::memory_order_acquire),
           "pool destruction must join an active task");
 }
+
+struct BurstTask {
+  std::atomic<size_t> *started{};
+  std::latch *release{};
+  std::atomic<size_t> *completed{};
+};
+
+auto shrinks_and_regrows() -> void {
+  using Queue = slp::LockingThreadSafeQueue<BurstTask>;
+  using Worker = decltype([](BurstTask &task) {
+    task.started->fetch_add(1, std::memory_order_release);
+    task.release->wait();
+    task.completed->fetch_add(1, std::memory_order_release);
+  });
+  auto queue = std::make_shared<Queue>();
+  slp::AdaptingThreadPool<Queue, Worker> pool{queue, 4};
+
+  // No new events occur once all workers are idle. Timed checks must prune
+  // them.
+  wait_until([&] { return pool.worker_count() == 1; },
+             "idle pool did not shrink to one worker");
+
+  // Hold callbacks open so growth is observable and cannot be hidden by a
+  // worker draining the whole burst before the adapter gets scheduled.
+  for (size_t cycle = 0; cycle < 3; ++cycle) {
+    std::atomic<size_t> started{0};
+    std::atomic<size_t> completed{0};
+    std::latch release{1};
+    std::array<BurstTask, 12> tasks;
+    for (auto &task : tasks) {
+      task = BurstTask{&started, &release, &completed};
+    }
+    if (cycle == 0) {
+      pool.submit_batch(tasks);
+    } else if (cycle == 1) {
+      for (auto &task : tasks) {
+        pool.submit(task);
+      }
+    } else {
+      // Legacy users can push directly and notify the pool explicitly.
+      for (auto &task : tasks) {
+        queue->push(task);
+      }
+      pool.wake_adapter();
+    }
+    wait_until(
+        [&] {
+          return started.load(std::memory_order_acquire) == 4 &&
+                 pool.worker_count() == 4;
+        },
+        "submission did not grow the pool to the worker cap");
+    require(pool.worker_count() == 4, "worker cap must be respected");
+    release.count_down();
+    wait_until(
+        [&] {
+          return completed.load(std::memory_order_acquire) == tasks.size();
+        },
+        "burst did not finish");
+    wait_until([&] { return pool.worker_count() == 1; },
+               "pool did not shrink after sustained idleness");
+  }
+}
+
+auto concurrent_submissions() -> void {
+  constexpr size_t task_count = 20000;
+  std::array<std::atomic<unsigned>, task_count> visits{};
+  std::atomic<size_t> completed{0};
+  using Queue = slp::LockingThreadSafeQueue<CountedTask>;
+  using Worker = decltype([](CountedTask &task) {
+    task.visits->fetch_add(1, std::memory_order_relaxed);
+    task.completed->fetch_add(1, std::memory_order_release);
+  });
+  auto queue = std::make_shared<Queue>();
+  {
+    slp::AdaptingThreadPool<Queue, Worker> pool{queue, 4};
+    std::vector<std::jthread> producers;
+    for (size_t producer = 0; producer < 4; ++producer) {
+      producers.emplace_back([&, producer] {
+        for (size_t i = producer; i < task_count; i += 4) {
+          pool.submit(CountedTask{&visits[i], &completed});
+        }
+      });
+    }
+    for (auto &producer : producers) {
+      producer.join();
+    }
+    wait_until(
+        [&] { return completed.load(std::memory_order_acquire) == task_count; },
+        "concurrent submissions did not finish");
+  }
+  for (auto &count : visits) {
+    require(count.load(std::memory_order_relaxed) == 1,
+            "concurrent submissions must execute exactly once");
+  }
+}
+
+auto rejects_null_queue() -> void {
+  using Queue = slp::LockingThreadSafeQueue<size_t>;
+  using Worker = decltype([](size_t &) {});
+  try {
+    slp::AdaptingThreadPool<Queue, Worker> pool{nullptr, 1};
+    require(false, "null queue must be rejected");
+  } catch (const std::invalid_argument &) {
+  }
+}
 } // namespace
 
 int main() {
@@ -100,5 +216,8 @@ int main() {
   // hardware_concurrency() is allowed to report zero; keep one worker usable.
   processes_tasks_once(0);
   shutdown_joins_active_task();
+  shrinks_and_regrows();
+  concurrent_submissions();
+  rejects_null_queue();
   std::println("Thread pool regression checks passed");
 }

@@ -1,184 +1,283 @@
 #pragma once
-#include "util.hpp"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <concepts>
+#include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <list>
 #include <memory>
+#include <mutex>
+#include <new>
+#include <print>
 #include <ranges>
+#include <stdexcept>
+#include <system_error>
 #include <thread>
 #include <utility>
-#include <vector>
-namespace slp{
+
+namespace slp {
 template <typename Q, typename W, typename TV = Q::value_type>
-concept WorkerWorksWithQueue = requires(TV& item) {
+concept WorkerWorksWithQueue = requires(TV &item) {
   { std::declval<W>()(item) } -> std::same_as<void>;
 };
 
 template <typename Queue, typename WorkerFunction, float MaxWaiting = 0.2f,
-          /*  Means with N threads running we can
-           have N*MaxQueuePressure tasks before
-we start summoning more threads */
-          float MaxQueuePressure = 1.5f>
+          float MaxQueuePressure = 1.5f, bool Verbose = false>
   requires(WorkerWorksWithQueue<Queue, WorkerFunction>)
 struct AdaptingThreadPool {
-
 private:
   using QueueItemType = Queue::value_type;
+  using Clock = std::chrono::steady_clock;
+  using ClockRep = Clock::duration::rep;
+  static_assert(MaxWaiting >= 0.0f && MaxWaiting < 1.0f);
+  static_assert(MaxQueuePressure > 0.0f);
+
+  static constexpr auto idle_grace = std::chrono::milliseconds{250};
+  static constexpr auto resize_interval = std::chrono::milliseconds{25};
+  static constexpr auto idle_check_interval = std::chrono::milliseconds{50};
+
   struct ThreadWrapper {
-    // Keep the worker's state alive until the thread handle has been destroyed.
-    std::atomic<bool> is_busy{false};
+    // State outlives the thread handle during reverse member destruction.
+    std::atomic<bool> is_waiting{false};
+    std::atomic<ClockRep> idle_since{0};
     std::jthread thread_handle;
   };
 
   std::atomic<bool> m_alive{true};
-
-  std::atomic<size_t> num_waiting{0};
-
-  std::atomic_flag m_adapter_thread_wakeup{};
-
+  std::atomic<size_t> m_num_waiting{0};
+  std::atomic<size_t> m_num_workers{0};
   const size_t m_max_threads;
+  std::shared_ptr<Queue> m_queue;
+
+  // Serialize predicate changes with the condition variable's wait operation.
+  std::mutex m_adapter_mutex;
+  std::condition_variable m_adapter_wakeup;
+  std::uint64_t m_adapter_event{0}; // guarded by m_adapter_mutex
+
+  // Only the adapter mutates the list once construction finishes. Destruction
+  // joins the adapter before accessing it. Workers hold stable node references.
+  std::list<ThreadWrapper> m_threads;
+  std::jthread m_adapter_thread;
 
   auto worker(std::stop_token stop_token, ThreadWrapper &ref) -> void {
-    // create instance of WorkerFunction lambda to run
     auto worker_lambda = WorkerFunction{};
-    while (m_alive.load(std::memory_order_acquire) and
-           not stop_token.stop_requested()) {
-      // try to pop item
-
-      num_waiting.fetch_add(1, std::memory_order_relaxed);
-
+    while (m_alive.load(std::memory_order_acquire) &&
+           !stop_token.stop_requested()) {
       QueueItemType item{};
-      while (not m_queue->try_pop(item)) {
-        if (stop_token.stop_requested() or
-            not m_alive.load(std::memory_order_acquire)) {
-          num_waiting.fetch_sub(1, std::memory_order_relaxed);
+      bool has_item = m_queue->try_pop(item);
+      if (!has_item) {
+        ref.idle_since.store(Clock::now().time_since_epoch().count(),
+                             std::memory_order_relaxed);
+        m_num_waiting.fetch_add(1, std::memory_order_release);
+        ref.is_waiting.store(true, std::memory_order_release);
+        wake_adapter();
+
+        // Notify on transitions, never on individual polling iterations.
+        while (m_alive.load(std::memory_order_acquire) &&
+               !stop_token.stop_requested()) {
+          if (m_queue->try_pop(item)) {
+            has_item = true;
+            break;
+          }
+          std::this_thread::yield();
+        }
+
+        ref.is_waiting.store(false, std::memory_order_release);
+        m_num_waiting.fetch_sub(1, std::memory_order_release);
+        wake_adapter();
+        if (!has_item) {
           return;
         }
-        std::this_thread::yield();
       }
-      num_waiting.fetch_sub(1, std::memory_order_relaxed);
-      ref.is_busy.store(true, std::memory_order_release);
+
       worker_lambda(item);
-      ref.is_busy.store(false, std::memory_order_release);
+      wake_adapter();
     }
   }
-  // Should only be called from the managing thread since only one thread should
-  // be mutating m_threads
+
   auto summon_thread() -> void {
-    // Construct in place: ThreadWrapper contains a non-movable atomic.
     m_threads.emplace_back();
     auto &back = m_threads.back();
-    back.thread_handle = std::jthread(
-        [this, &back](std::stop_token token) { worker(token, back); });
+    try {
+      back.thread_handle = std::jthread(
+          [this, &back](std::stop_token token) { worker(token, back); });
+    } catch (...) {
+      m_threads.pop_back();
+      throw;
+    }
+    m_num_workers.store(m_threads.size(), std::memory_order_release);
+  }
+
+  auto rebalance(Clock::time_point now) -> void {
+    const auto previous_workers = m_threads.size();
+    const auto queue_size = m_queue->size();
+    if (queue_size > 0) {
+      // Grow to satisfy the queue-pressure target, bounded by the worker cap.
+      // Use a comparison rather than mixing floating-point and size_t in min().
+      while (m_alive.load(std::memory_order_acquire) &&
+             m_threads.size() < m_max_threads &&
+             static_cast<double>(queue_size) >
+                 static_cast<double>(MaxQueuePressure) * m_threads.size()) {
+        try {
+          summon_thread();
+        } catch (const std::system_error &) {
+          // Keep existing workers usable if another thread cannot be created.
+          break;
+        } catch (const std::bad_alloc &) {
+          break;
+        }
+      }
+      if constexpr (Verbose) {
+        if (m_threads.size() != previous_workers) {
+          std::println("[adapter] grow {} -> {} workers: queued={} (snapshot), "
+                       "pressure target={}, cap={}",
+                       previous_workers, m_threads.size(), queue_size,
+                       MaxQueuePressure, m_max_threads);
+        }
+      }
+      return;
+    }
+
+    const auto num_threads = m_threads.size();
+    const auto n_waiting =
+        std::min(m_num_waiting.load(std::memory_order_acquire), num_threads);
+    const auto allowed_waiting =
+        static_cast<size_t>(static_cast<double>(MaxWaiting) * num_threads);
+    if (num_threads <= 1 || n_waiting <= allowed_waiting) {
+      return;
+    }
+    auto remaining = std::min(n_waiting - allowed_waiting, num_threads - 1);
+    for (auto it = m_threads.begin(); it != m_threads.end() && remaining > 0;) {
+      if (!m_alive.load(std::memory_order_acquire) || !m_queue->is_empty()) {
+        break;
+      }
+      if (it->is_waiting.load(std::memory_order_acquire) &&
+          now - Clock::time_point{Clock::duration{
+                    it->idle_since.load(std::memory_order_relaxed)}} >=
+              idle_grace) {
+        it->thread_handle.request_stop();
+        it->thread_handle.join();
+        it = m_threads.erase(it);
+        m_num_workers.store(m_threads.size(), std::memory_order_release);
+        --remaining;
+      } else {
+        ++it;
+      }
+    }
+    if constexpr (Verbose) {
+      if (m_threads.size() != previous_workers) {
+        std::println("[adapter] shrink {} -> {} workers: queued=0 (snapshot), "
+                     "waiting={} (snapshot), idle grace={} ms",
+                     previous_workers, m_threads.size(), n_waiting,
+                     idle_grace.count());
+      }
+    }
+  }
+
+  auto manage_threads() -> void {
+    auto next_resize = Clock::now();
+    while (true) {
+      std::unique_lock lock{m_adapter_mutex};
+      // Debounce frequent task notifications; shutdown bypasses the cooldown.
+      m_adapter_wakeup.wait_until(lock, next_resize, [this] {
+        return !m_alive.load(std::memory_order_acquire);
+      });
+      if (!m_alive.load(std::memory_order_acquire)) {
+        return;
+      }
+      const auto observed = m_adapter_event;
+      lock.unlock();
+
+      rebalance(Clock::now());
+      next_resize = Clock::now() + resize_interval;
+
+      lock.lock();
+      // Events during rebalance are retained by the counter. A timeout lets
+      // sustained idleness trigger shrinking even if no further events occur.
+      m_adapter_wakeup.wait_for(lock, idle_check_interval, [this, observed] {
+        return m_adapter_event != observed ||
+               !m_alive.load(std::memory_order_acquire);
+      });
+    }
   }
 
   auto stop_workers() -> void {
     m_alive.store(false, std::memory_order_release);
+    wake_adapter();
+    if (m_adapter_thread.joinable()) {
+      m_adapter_thread.join();
+    }
+    // The adapter can no longer resize the worker list.
     for (auto &item : m_threads) {
       item.thread_handle.request_stop();
     }
     for (auto &item : m_threads) {
-      if (item.thread_handle.joinable()) {
-        item.thread_handle.join();
-      }
+      item.thread_handle.join();
     }
     m_threads.clear();
+    m_num_workers.store(0, std::memory_order_release);
   }
-
-  auto manage_threads() -> void {
-    while (m_alive.load(std::memory_order_relaxed)) {
-      // check how many threads are actually there
-      // -1 since adapter thread doesent count
-      const auto num_threads = m_threads.size() - 1;
-      const auto n_waiting = num_waiting.load(std::memory_order_acquire);
-
-      // how many threads we can keep waiting
-      //  for example we might want at most 20% of workers sitting around idle
-      const auto idle_ratio = divide_fp(n_waiting, m_max_threads);
-      if (idle_ratio > MaxWaiting) {
-        // kill some threads to relieve pressure
-
-        if (const auto num_threads_to_kill =
-                (idle_ratio - MaxWaiting) * m_max_threads;
-            num_threads_to_kill > 0) {
-          auto kill_count{0uz};
-
-          auto items_to_remove =
-              std::vector<typename decltype(m_threads)::iterator>();
-          items_to_remove.reserve(num_threads_to_kill);
-          for (auto it = m_threads.begin(); it != m_threads.end(); ++it) {
-            if (not it->is_busy.load(std::memory_order_acquire)) {
-              // thread isnt busy, kill it
-              it->thread_handle.request_stop();
-              kill_count++;
-              items_to_remove.push_back(it);
-              if (kill_count >= num_threads_to_kill) {
-                break;
-              }
-            }
-          }
-
-          for (auto iter : items_to_remove) {
-            // The worker still references this wrapper until it has exited.
-            iter->thread_handle.join();
-            m_threads.erase(iter);
-          }
-        }
-
-      } else {
-        // check if we need to summon more threads
-        const auto queue_size = m_queue->size();
-        const auto queue_pressure = divide_fp(queue_size, m_threads.size());
-        if (queue_pressure > MaxQueuePressure) {
-          // summon more threads
-          constexpr static auto calc_workers_to_sommon =
-              [](size_t NumItems, size_t CurrWorkers, float idealPressure) {
-                return (NumItems - (idealPressure * CurrWorkers)) / CurrWorkers;
-              };
-          const auto num_workers_to_summon =
-              std::min(m_max_threads - m_threads.size(),
-                       calc_workers_to_sommon(queue_size, m_threads.size(),
-                                              MaxQueuePressure));
-          if (num_workers_to_summon > 0) {
-            for (auto i{0uz}; i < num_workers_to_summon; ++i) {
-              summon_thread();
-            }
-          }
-        }
-      }
-      // wait till someone wakes (preferable a worker thread )
-      m_adapter_thread_wakeup.wait(false, std::memory_order_acquire);
-    }
-  }
-
-  // Stable list nodes hold the state referenced by each worker.
-  std::list<ThreadWrapper> m_threads;
-
-  std::shared_ptr<Queue> m_queue;
 
 public:
-  AdaptingThreadPool(
-      std::shared_ptr<Queue> queue,
-      size_t max_threads = std::thread::hardware_concurrency())
+  AdaptingThreadPool(std::shared_ptr<Queue> queue,
+                     size_t max_threads = std::thread::hardware_concurrency())
       : m_max_threads(std::max(max_threads, size_t{1})),
         m_queue(std::move(queue)) {
-    // Start the configured worker count.
+    if (!m_queue) {
+      throw std::invalid_argument{"thread pool requires a queue"};
+    }
     try {
-      for(auto i{0uz}; i < m_max_threads; ++i) {
+      for (size_t i = 0; i < m_max_threads; ++i) {
         summon_thread();
       }
+      if constexpr (Verbose) {
+        std::println("[pool] started {} workers; limit={}", m_threads.size(),
+                     m_max_threads);
+      }
+      m_adapter_thread = std::jthread([this] { manage_threads(); });
     } catch (...) {
-      // A failed thread creation must not leave earlier workers using this pool.
       stop_workers();
       throw;
     }
   }
 
-  ~AdaptingThreadPool() {
-    stop_workers();
+  ~AdaptingThreadPool() { stop_workers(); }
+
+  // Direct queue users can signal explicitly; submit() does it automatically.
+  auto wake_adapter() -> void {
+    {
+      std::lock_guard lock{m_adapter_mutex};
+      ++m_adapter_event;
+    }
+    m_adapter_wakeup.notify_one();
+  }
+
+  template <typename U>
+    requires std::constructible_from<QueueItemType, U &&>
+  auto submit(U &&item) -> void {
+    m_queue->push(std::forward<U>(item));
+    wake_adapter();
+  }
+
+  template <std::ranges::input_range Range>
+    requires std::constructible_from<QueueItemType,
+                                     std::ranges::range_reference_t<Range>>
+  auto submit_batch(Range &&items) -> void {
+    try {
+      for (auto &&item : items) {
+        m_queue->push(std::forward<decltype(item)>(item));
+      }
+    } catch (...) {
+      wake_adapter(); // Earlier items in a partially submitted batch need work.
+      throw;
+    }
+    wake_adapter();
+  }
+
+  [[nodiscard]] auto worker_count() const noexcept -> size_t {
+    return m_num_workers.load(std::memory_order_acquire);
   }
 };
-
-}
+} // namespace slp
