@@ -1,5 +1,6 @@
 #pragma once
 #include "basic_thread_safe_queue.hpp"
+#include "thread_pool.hpp"
 #include "util.hpp"
 #include <atomic>
 #include <cassert>
