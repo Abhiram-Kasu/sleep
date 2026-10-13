@@ -10,6 +10,9 @@ namespace slp {
 // Maybe have a timeout system so that if there is not enough IO bound tasks, we
 // can shift threads to cpu bound work?
 template <typename T> struct LockingThreadSafeQueue {
+public:
+  using value_type = T;
+
 private:
   mutable std::mutex m_mutex{};
   std::queue<T> m_queue{};
@@ -28,7 +31,7 @@ public:
     return m_queue.empty();
   }
 
-  auto count() const -> std::size_t {
+  auto size() const -> std::size_t {
     std::lock_guard lock{m_mutex};
     return m_queue.size();
   }
