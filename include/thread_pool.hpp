@@ -42,7 +42,7 @@ private:
 
       // how many threads we can keep waiting
       //  for example we might want at most 20% of workers sitting around idle
-      const auto idle_ratio = divide(n_waiting, MaxThreads);
+      const auto idle_ratio = divide_fp(n_waiting, MaxThreads);
       if (idle_ratio > MaxWaiting) {
         // kill some threads to relieve pressure
 
@@ -76,7 +76,7 @@ private:
       } else {
         // check if we need to summon more threads
         const auto queue_size = m_queue.size();
-        const auto queue_pressure = divide(queue_size, m_threads.size());
+        const auto queue_pressure = divide_fp(queue_size, m_threads.size());
         if (queue_pressure > MaxQueuePressure) {
           // summon more threads
           constexpr static auto calc_workers_to_sommon =

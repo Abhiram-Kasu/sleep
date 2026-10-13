@@ -27,9 +27,12 @@ template <typename T, typename C>
 concept is_statically_convertible = requires(T item) {
     static_cast<C>(item);
 };
-template <typename ResultType = float, typename... Args>
-requires ((is_statically_convertible<Args, ResultType> or std::convertible_to<Args, ResultType>) && ...)
-[[nodiscard]] constexpr auto divide(Args &&...params) -> ResultType
+
+
+
+template <typename... Args, std::floating_point ResultType = float>
+requires ( (is_statically_convertible<Args, ResultType> or std::convertible_to<Args, ResultType>) && ...)
+[[nodiscard]] constexpr auto divide_fp(Args &&...params) -> ResultType
 {
     // The compiler guarantees at least one cast method works
     return (static_cast<ResultType>(std::forward<Args>(params)) / ...);
