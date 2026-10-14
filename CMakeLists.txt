@@ -7,16 +7,33 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS TRUE)
 
-# Set BUILD_SHARED_LIBS=ON to build the runtime as a shared library. By default,
-# the runtime is built as a static library.
-add_library(sleep_runtime
-    src/runtime.cpp
-)
+find_package(Threads REQUIRED)
 
-target_include_directories(sleep_runtime
-    PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
+# Build both library variants, including the C thread-pool exports.
+set(SLEEP_RUNTIME_SOURCES
+    src/runtime.cpp
+    lib_export/thread_pool_export.cpp
 )
+add_library(sleep_runtime STATIC ${SLEEP_RUNTIME_SOURCES})
+add_library(sleep_runtime_shared SHARED ${SLEEP_RUNTIME_SOURCES})
+set_target_properties(sleep_runtime_shared PROPERTIES
+    OUTPUT_NAME sleep_runtime
+    WINDOWS_EXPORT_ALL_SYMBOLS ON
+)
+if(WIN32)
+    # Keep the DLL import library distinct from the static .lib.
+    set_target_properties(sleep_runtime_shared PROPERTIES
+        ARCHIVE_OUTPUT_NAME sleep_runtime_import
+    )
+endif()
+
+foreach(runtime_target IN ITEMS sleep_runtime sleep_runtime_shared)
+    target_include_directories(${runtime_target}
+        PUBLIC
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_link_libraries(${runtime_target} PUBLIC Threads::Threads)
+endforeach()
 
 add_executable(sleep
     src/main.cpp
