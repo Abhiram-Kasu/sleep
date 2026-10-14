@@ -166,6 +166,54 @@ auto shrinks_and_regrows() -> void {
   }
 }
 
+auto shares_captured_worker_across_resizes() -> void {
+  using Queue = slp::LockingThreadSafeQueue<size_t>;
+  std::atomic<size_t> started{0};
+  std::atomic<size_t> completed{0};
+  std::atomic<size_t> total{0};
+  std::latch release{1};
+  // Owning an atomic makes this mutable lambda move-only. Its state must
+  // survive worker retirement and be shared with newly created workers.
+  auto state = std::make_unique<std::atomic<size_t>>(0);
+  auto *shared_calls = state.get();
+  auto worker = [calls = std::move(state), bias = size_t{7}, &started,
+                 &completed, &total, &release](size_t &item) mutable {
+    calls->fetch_add(1, std::memory_order_relaxed);
+    started.fetch_add(1, std::memory_order_release);
+    release.wait();
+    total.fetch_add(item + bias, std::memory_order_relaxed);
+    completed.fetch_add(1, std::memory_order_release);
+  };
+  auto queue = std::make_shared<Queue>();
+  slp::AdaptingThreadPool<Queue, decltype(worker)> pool{
+      queue, std::move(worker), 4};
+  wait_until([&] { return pool.worker_count() == 1; },
+             "capturing worker pool did not shrink");
+  std::array<size_t, 12> tasks;
+  tasks.fill(3);
+  pool.submit_batch(tasks);
+  wait_until(
+      [&] {
+        return started.load(std::memory_order_acquire) == 4 &&
+               pool.worker_count() == 4;
+      },
+      "capturing worker pool did not regrow");
+  release.count_down();
+  wait_until([&] { return completed.load(std::memory_order_acquire) == 12; },
+             "capturing workers did not finish");
+  require(total.load(std::memory_order_relaxed) == 120,
+          "workers must use the supplied captures");
+  require(shared_calls->load(std::memory_order_relaxed) == 12,
+          "all workers must invoke the pool's stored callable");
+  wait_until([&] { return pool.worker_count() == 1; },
+             "capturing worker pool did not shrink after work");
+  pool.submit(size_t{3});
+  wait_until([&] { return completed.load(std::memory_order_acquire) == 13; },
+             "capturing worker did not process a later task");
+  require(shared_calls->load(std::memory_order_relaxed) == 13,
+          "captured state must survive resizing");
+}
+
 auto concurrent_submissions() -> void {
   constexpr size_t task_count = 20000;
   std::array<std::atomic<unsigned>, task_count> visits{};
@@ -217,6 +265,7 @@ int main() {
   processes_tasks_once(0);
   shutdown_joins_active_task();
   shrinks_and_regrows();
+  shares_captured_worker_across_resizes();
   concurrent_submissions();
   rejects_null_queue();
   std::println("Thread pool regression checks passed");

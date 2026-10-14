@@ -20,7 +20,7 @@
 namespace slp {
 template <typename Q, typename W, typename TV = Q::value_type>
 concept WorkerWorksWithQueue = requires(TV &item) {
-  { std::declval<W>()(item) } -> std::same_as<void>;
+  { std::declval<W &>()(item) } -> std::same_as<void>;
 };
 
 template <typename Queue, typename WorkerFunction, float MaxWaiting = 0.2f,
@@ -50,6 +50,8 @@ private:
   std::atomic<size_t> m_num_workers{0};
   const size_t m_max_threads;
   std::shared_ptr<Queue> m_queue;
+  // All workers share this callable; captured mutable state must be thread-safe.
+  WorkerFunction m_worker_function;
 
   // Serialize predicate changes with the condition variable's wait operation.
   std::mutex m_adapter_mutex;
@@ -62,7 +64,6 @@ private:
   std::jthread m_adapter_thread;
 
   auto worker(std::stop_token stop_token, ThreadWrapper &ref) -> void {
-    auto worker_lambda = WorkerFunction{};
     while (m_alive.load(std::memory_order_acquire) &&
            !stop_token.stop_requested()) {
       QueueItemType item{};
@@ -92,7 +93,7 @@ private:
         }
       }
 
-      worker_lambda(item);
+      m_worker_function(item);
       wake_adapter();
     }
   }
@@ -223,8 +224,14 @@ private:
 public:
   AdaptingThreadPool(std::shared_ptr<Queue> queue,
                      size_t max_threads = std::thread::hardware_concurrency())
+    requires std::default_initializable<WorkerFunction>
+      : AdaptingThreadPool(std::move(queue), WorkerFunction{}, max_threads) {}
+
+  AdaptingThreadPool(std::shared_ptr<Queue> queue, WorkerFunction worker_function,
+                     size_t max_threads = std::thread::hardware_concurrency())
       : m_max_threads(std::max(max_threads, size_t{1})),
-        m_queue(std::move(queue)) {
+        m_queue(std::move(queue)),
+        m_worker_function(std::move(worker_function)) {
     if (!m_queue) {
       throw std::invalid_argument{"thread pool requires a queue"};
     }
