@@ -1,10 +1,12 @@
-#:property PublishAot=false
+#:property PublishAot=true
+#:property AllowUnsafeBlocks=true
 #:property TieredCompilation=false
 
 // Requires .NET 10 and the root project's C++26 toolchain. From this folder:
-// cmake -S ../.. -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
-// cmake --build build --target sleep_runtime_shared
-// dotnet run --file Benchmark.cs -c Release -- [jobs] [numbersPerJob] [rounds]
+// make run                       # JIT benchmark
+// make run-aot                   # Native AOT benchmark
+// make bench ARGS="44 1000000 5"  # Both, with a custom workload
+// make test                      # Quick correctness checks on both builds
 
 using System;
 using System.Diagnostics;
@@ -15,29 +17,29 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 
-static class Benchmark
+static unsafe partial class Benchmark
 {
     [StructLayout(LayoutKind.Sequential)]
     struct ExternRef { public nint Ptr; }
 
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    delegate void Worker(ExternRef value);
-
-    // Keep the delegate alive until all native workers have joined.
-    static readonly Worker Callback = value =>
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    static void Callback(ExternRef value)
     {
         var job = (Job)GCHandle.FromIntPtr(value.Ptr).Target!;
         try { job.Run(); }
         catch (Exception error) { job.Error = error; }
         finally { job.Done!.Signal(); }
-    };
+    }
 
-    [DllImport("sleep_runtime", CallingConvention = CallingConvention.Cdecl)]
-    static extern nint create_thread_pool_ref(Worker worker);
-    [DllImport("sleep_runtime", CallingConvention = CallingConvention.Cdecl)]
-    static extern void push_value_thread_pool_ref(ExternRef value, nint pool);
-    [DllImport("sleep_runtime", CallingConvention = CallingConvention.Cdecl)]
-    static extern void clean_thread_pool(nint pool);
+    [LibraryImport("sleep_runtime")]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    private static partial nint create_thread_pool_ref(delegate* unmanaged[Cdecl]<ExternRef, void> worker);
+    [LibraryImport("sleep_runtime")]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    private static partial void push_value_thread_pool_ref(ExternRef value, nint pool);
+    [LibraryImport("sleep_runtime")]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    private static partial void clean_thread_pool(nint pool);
 
     sealed class Job(int start, int count)
     {
@@ -69,7 +71,7 @@ static class Benchmark
     {
         using var done = new CountdownEvent(jobs.Length);
         var handles = new GCHandle[jobs.Length];
-        nint pool = create_thread_pool_ref(Callback);
+        nint pool = create_thread_pool_ref(&Callback);
         if (pool == 0) throw new InvalidOperationException("Native pool creation failed");
         try
         {
