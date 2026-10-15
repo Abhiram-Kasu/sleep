@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := build
 ARGS ?=
-# Benchmark runs must not compete for CPU.
+# Avoid competing benchmark runs and inherited parallel-build jobserver state.
 .NOTPARALLEL:
 
 .PHONY: build native run aot run-aot bench test clean
