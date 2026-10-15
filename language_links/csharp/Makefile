@@ -1,35 +1,36 @@
 .DEFAULT_GOAL := build
 ARGS ?=
-# Avoid competing benchmark runs and inherited parallel-build jobserver state.
+FILTER ?= *
+# Benchmark processes must not compete for CPU.
 .NOTPARALLEL:
 
-.PHONY: build native run aot run-aot bench test clean
+.PHONY: build native run bench run-aot aot test smoke clean
 
 native:
-	cmake -S ../.. -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+	cmake -S ../.. -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
 	cmake --build build --target sleep_runtime_shared
 
 build: native
-	dotnet build Benchmark.cs -c Release
+	dotnet build Benchmark.csproj -c Release
 
+# BenchmarkDotNet publishes isolated ReadyToRun or Native AOT executables.
 run: native
-	dotnet run --file Benchmark.cs -c Release -- $(ARGS)
+	dotnet run --project Benchmark.csproj -c Release -- --filter '$(FILTER)' $(ARGS)
 
-aot: native
-	dotnet publish Benchmark.cs -c Release -o build/aot
+run-aot aot: native
+	dotnet run --project Benchmark.csproj -c Release -- --filter '$(FILTER)' --aot $(ARGS)
 
-run-aot: aot
-	./build/aot/Benchmark $(ARGS)
+bench: native
+	dotnet run --project Benchmark.csproj -c Release -- --filter '$(FILTER)' --both $(ARGS)
 
-# Run the two benchmark modes sequentially.
-bench:
-	$(MAKE) run
-	$(MAKE) run-aot
+test: native
+	cmake --build build --target thread_pool_test sleep
+	ctest --test-dir build --output-on-failure
+	dotnet run --project Benchmark.csproj -c Release -- --test
 
-test:
-	$(MAKE) run ARGS="3 10 2"
-	$(MAKE) run-aot ARGS="3 10 2"
+# Validate every benchmark case in both runtimes; Dry timings are not results.
+smoke: native
+	dotnet run --project Benchmark.csproj -c Release -- --filter '$(FILTER)' --both --job Dry $(ARGS)
 
 clean:
-	dotnet clean Benchmark.cs -c Release --verbosity quiet
-	rm -rf build
+	rm -rf build bin obj BenchmarkDotNet.Artifacts
